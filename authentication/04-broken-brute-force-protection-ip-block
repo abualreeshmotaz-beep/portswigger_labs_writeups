@@ -1,0 +1,71 @@
+# Broken Brute-Force Protection, IP Block
+
+**Lab:** [Broken brute-force protection, IP block](https://portswigger.net/web-security/authentication/password-based/lab-broken-bruteforce-protection-ip-block) — PortSwigger Web Security Academy
+**Category:** Authentication — Password-Based Login
+**Difficulty:** Practitioner
+
+## Problem
+
+The application blocks an IP address after 3 incorrect login attempts in a row. There's a known-valid account (`wiener:peter`) and a target username (`carlos`), with a candidate password wordlist to brute-force against him. The goal is to defeat the IP block and recover Carlos's password.
+
+## Discovery / Exploitation
+
+The block only triggers on **consecutive** failed attempts from the same IP — and logging in successfully resets that counter back to zero. That's the logic flaw: the protection counts a streak, not a total, and nothing stops you from interrupting the streak with a login you know will succeed.
+
+So instead of sending a continuous stream of `carlos` guesses (which trips the block after 3), the requests are interleaved: a correct `wiener:peter` login first (resets the counter), followed by **two** `carlos` guesses (never reaching the 3-in-a-row threshold), then another `wiener:peter` login to reset again, then two more `carlos` guesses, and so on. The IP never accumulates 3 consecutive failures, so it's never blocked, while still working through the whole password wordlist two guesses at a time.
+
+This has to be sent as a **pitchfork** attack (two payload lists marched in lockstep, not every combination of the two) so that each username lines up with the correct password in the same request — and with the resource pool capped at **1 concurrent request**, so the requests actually hit the server in the exact order built, which matters since the block/reset logic is order-dependent.
+
+**Steps taken (Burp Suite):**
+
+1. Captured a `POST /login` request and sent it to Burp Intruder.
+2. Set attack type to **Pitchfork**, with payload positions on both `username` and `password`.
+3. Under **Resource pool**, created a pool with **Maximum concurrent requests = 1** to preserve request ordering.
+4. Built payload list 1 (`username`) as: `wiener`, `carlos`, `carlos`, `wiener`, `carlos`, `carlos`, ... repeating, with `wiener` always first in each group of three.
+5. Built payload list 2 (`password`) aligned 1:1 with list 1: `peter`, `<guess 1>`, `<guess 2>`, `peter`, `<guess 3>`, `<guess 4>`, ... pulling two fresh guesses from the candidate password wordlist for every `wiener` reset.
+6. Ran the attack, filtered out `200` responses, and sorted the remainder by username. The single `302` (redirect = successful login) for `username=carlos` revealed the correct password.
+7. Logged in as `carlos` with that password and loaded his account page — lab solved.
+
+## Proof of Concept
+
+Rather than building both payload lists by hand, a small script generates them in the right interleaved order so they can be pasted straight into Burp Intruder's Simple list payloads:
+
+```python
+print("############## The following are the usernames: ##############")
+
+for i in range(150):
+    if i % 3:
+        print("carlos")
+    else:
+        print("wiener")
+
+print("############## The following are the passwords: ##############")
+
+with open("passwords.txt", "r") as f:
+    lines = f.readlines()
+
+i = 0
+for pwd in lines:
+    if i % 3:
+        print(pwd.strip('\n'))
+    else:
+        print("peter")
+        print(pwd.strip('\n'))
+        i = i + 1
+    i = i + 1
+```
+
+**How it lines up:**
+
+- The username loop repeats `wiener, carlos, carlos` every 3 entries — `wiener` resets the attempt counter, and the two `carlos` entries that follow never reach the 3-in-a-row block threshold.
+- The password loop walks through `passwords.txt` two entries at a time per cycle: it prints `peter` (for the `wiener` reset) followed by the next password guess, then on the next iteration prints just the following guess — so each `wiener, carlos, carlos` group gets `peter, guessA, guessB`, consuming the wordlist sequentially without skipping or repeating entries.
+- `range(150)` gives 50 reset cycles (150 ÷ 3), enough to cover 100 password guesses (50 cycles × 2 guesses each) — sized to the candidate password list.
+
+Paste the usernames block into payload list 1 and the passwords block into payload list 2 in Intruder, run the pitchfork attack with the resource pool capped at 1, then filter for the `302` response to read off Carlos's password.
+
+## Remediation
+
+- Base brute-force protection on a rolling count of failed attempts within a time window, not a "consecutive failures" streak that a single successful login can reset.
+- Lock or rate-limit by account (and ideally by IP + account combined), not just by IP — an attacker can always interleave a known-good login to reset an IP-only streak counter.
+- Don't let the attacker control when the counter resets. Lockout logic should be based on failed-attempt volume over time, independent of any successful logins happening in between.
+- Add CAPTCHA or escalating delays after repeated failures, and alert on abnormal login volume against a single target account regardless of whether a legitimate login is mixed in.
