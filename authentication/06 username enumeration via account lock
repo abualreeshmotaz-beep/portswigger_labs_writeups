@@ -1,0 +1,78 @@
+# Username Enumeration via Account Lock
+
+**Lab:** [Username enumeration via account lock](https://portswigger.net/web-security/authentication/password-based/lab-username-enumeration-via-account-lock) — PortSwigger Web Security Academy
+**Category:** Authentication — Password-Based Login
+**Difficulty:** Practitioner
+
+## Problem
+
+The application uses account locking as a brute-force defense, but the lockout logic leaks information: a username that gets locked out behaves differently from one that doesn't, which is enough to enumerate valid usernames before ever brute-forcing a password. The goal is to find a valid username via this flaw, brute-force that user's password, and access their account page.
+
+Wordlists provided by the lab:
+- [Candidate usernames](https://portswigger.net/web-security/authentication/auth-lab-usernames)
+- [Candidate passwords](https://portswigger.net/web-security/authentication/auth-lab-passwords)
+
+## Discovery / Exploitation
+
+The account lock only kicks in after several failed attempts *against a username that actually exists* — a nonexistent username can never accumulate failed attempts toward a lockout, because there's no account to lock. So if the same invalid password is submitted several times in a row for every candidate username, real usernames will eventually flip into a locked state and start returning a different error (`You have made too many incorrect login attempts.`) instead of the generic `Invalid username or password.`. That difference in response — different message, different length — reveals which usernames are valid, without ever knowing a correct password.
+
+**Steps taken (Burp Suite):**
+
+1. Captured a `POST /login` request with an invalid username and password, sent it to Burp Intruder.
+2. Selected **Cluster bomb** attack, with payload positions on `username` and a second, blank position at the end of the request body:
+   `username=§invalid-username§&password=example§§`
+3. Payload list 1 (`username`): candidate usernames wordlist. Payload list 2: a **Null payloads** type generating 5 empty payloads — this repeats every username 5 times in a row against the same invalid password, enough failed attempts to trigger a lockout on any username that actually exists.
+4. Ran the attack and compared response lengths/content across usernames — one stood out with a longer response containing `You have made too many incorrect login attempts.` instead of the generic error. That's the valid, now-locked username.
+5. Started a fresh **Sniper** attack on `POST /login`, fixed `username` to the identified value, and added a payload position on `password` using the candidate password wordlist.
+6. Added a Grep - Extract rule for the error message and ran the attack.
+7. Checked the Grep-Extract column: most rows showed an error message, but one row showed **no error message at all** — that's the correct password (a successful login doesn't return an error).
+8. Waited roughly a minute for the account lock to expire, then logged in with the identified username/password and loaded the account page — lab solved.
+
+## Proof of Concept
+
+Burp's built-in Null payloads type (step 3 above) does the username-repetition for you, but it isn't available in every Burp edition/config. As a workaround, a small Node.js script builds the same repeated-username payload list directly, so it can be pasted into Intruder as a plain Simple list instead:
+
+```javascript
+const fs = require('fs');
+const readline = require('readline');
+
+const fileStream = fs.createReadStream('username_wordlist.txt');
+const rl = readline.createInterface({
+  input: fileStream,
+  crlfDelay: Infinity
+});
+
+let content = '';
+
+async function processLines() {
+  for await (const line of rl) {
+    for (let i = 1; i < 6; i++) {
+      content += line + '\n';
+    }
+  }
+  return content;
+}
+
+processLines().then((res) => {
+  fs.writeFile('./5usernames.txt', res, (err) => {
+    if (err) { console.error(err); }
+  });
+});
+```
+
+This reads the candidate usernames wordlist line by line and writes each username out 5 times in a row, producing a single flat list of the same length as a cluster bomb with a 5-payload null position would generate — e.g. `alice, alice, alice, alice, alice, bob, bob, bob, bob, bob, ...`.
+
+**Usage:**
+
+1. Run `node script.js` against the downloaded usernames wordlist (`username_wordlist.txt`) to produce `5usernames.txt`.
+2. In Burp Intruder, set attack type to **Sniper** (single payload position, since repetition is now baked into the list itself) on `username`, with `password` fixed to any invalid value.
+3. Load `5usernames.txt` as the Simple list payload.
+4. Run the attack and look for the response with the different length/error message (`You have made too many incorrect login attempts.`) — that username is valid.
+5. Continue with a second Sniper attack (username fixed, password as payload + Grep-Extract) exactly as in steps 5–7 above to recover the password.
+
+## Remediation
+
+- Keep lockout-related responses (and timing) identical regardless of whether the submitted username exists — don't return a distinct "too many attempts" message only for real accounts.
+- Avoid account-based lockout entirely as the sole defense, since it both enables enumeration and can be weaponized for denial-of-service against known users; prefer rate-limiting by IP/device combined with account-level throttling that doesn't leak existence.
+- Add generic, constant-time responses for all login failure paths (unknown username, wrong password, locked account) so no response property — length, wording, status code, or timing — differs between them.
+- Monitor and alert on repeated failed-login sweeps across many usernames from a single source, which is a strong signal of an enumeration attempt regardless of whether any single account gets locked.
